@@ -1,26 +1,32 @@
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.channels.SendChannel
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import java.time.LocalDateTime
-import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
-var keepGoing = true
 fun main(args: Array<String>) {
-    val channel = Channel<SampleChannelMessage>(Channel.UNLIMITED);
+    println("MAIN: Starting application...")
     val scope = CoroutineScope(Job())
-    scope.launch {
+    val channel = Channel<SampleChannelMessage>(Channel.UNLIMITED)
+    channel.invokeOnClose {
+        println("MAIN: Channel closed reason: ${it?.message}")
+        scope.coroutineContext.cancelChildren()
+    }
+
+    val pubJob = scope.launch {
         PubApp(channel).start()
     }
-    scope.launch {
+    val subJob = scope.launch {
         SubApp(channel).start()
     }
-    // I want to keep the whole program going, but I don't know the proper way yet
-    while (keepGoing) {}
+    // keep the whole program going until user cancels
+    runBlocking {
+        pubJob.join()
+        subJob.join()
+    }
+    println("MAIN: Shut down application.")
 }
 
 data class SampleChannelMessage(val type: String, val total: Double, val msg: String?) {
@@ -31,59 +37,70 @@ class PubApp(_channel: SendChannel<SampleChannelMessage>) {
     private val scope = CoroutineScope(Job())
     private val channel = _channel
     fun start() {
-        var loop = 0
-        println("PubApp: getting and publishing events...")
-        while (getMessage()) {
-            println("Looped ${++loop}")
+        println("PubApp: starting shop...")
+        while (!channel.isClosedForSend) {
+            val msg = getMessage()
+            if (msg == "") {
+                println("PubApp: closing channel...")
+                channel.close()
+                println("PubApp: channel closed.")
+                break
+            }
+            println("PubApp: You entered: [$msg]")
+            scope.launch {
+                sendEvent(msg)
+            }
         }
-        println("Customers tired, closing shop.")
-        keepGoing = false
-//        channel.close()
+
+        println("PubApp: Customers tired, closing shop.")
     }
 
-    private fun getMessage(): Boolean {
-        print("Please enter a message: ")
-        val msg = readLine()!!
-        println("\nYou entered: [$msg]")
-        if (msg == "") return false;
-        val words = msg.split(' ').toMutableList()
-//        val msg = readLine()!!
-        println("")
-        sendEvent(msg)
-        return true
+    private fun getMessage(): String {
+        println("PubApp: Please enter a message: ")
+        return readLine() ?: ""
     }
 
-    private fun sendEvent(msg: String) {
-        scope.launch {
-            val cm = SampleChannelMessage("SUCCESS", 1.0, msg)
-            channel.send(cm)
-            println("PubApp: published event.")
-            channel.close()
-        }
+    private suspend fun sendEvent(msg: String) {
+        val cm = SampleChannelMessage("SUCCESS", 1.0, msg)
+        println("PubApp: sending message...")
+        channel.send(cm)
+        println("PubApp: message [$msg] sent.")
     }
 }
 
 class SubApp(_channel: ReceiveChannel<SampleChannelMessage>) {
     private val scope = CoroutineScope(Job())
     private val channel = _channel
+
     fun start() {
-        println("SubApp: monitoring published events...")
-        receiveEvent()
+        println("SubApp: starting monitoring of published events...")
+        while (!channel.isClosedForReceive) {
+            val evtMsg = receiveEvent() ?: break
+            notifyCustomer(evtMsg)
+        }
+        println("SubApp: event channel is closed, closing event monitoring.")
     }
 
-    private fun receiveEvent() {
-        var keepReading = true
-        while (keepReading) {
-            try {
-                scope.launch {
-                    var cm: SampleChannelMessage = channel.receive()
-                    println("SubApp: received published event:")
-                    println(cm)
-                }
-            }
-            catch (e: Exception) {
-                keepReading = false
-            }
+    class SourceClosed(cause: Throwable) : IllegalStateException(cause)
+
+    private fun receiveEvent(): SampleChannelMessage? = runBlocking {
+        println("SubApp: getting published event...")
+        var cm: SampleChannelMessage?
+        try {
+            println("SubApp: receiving message...")
+            cm = channel.receive()
+            println("SubApp: message [$cm] received.")
         }
+        catch (e: ClosedReceiveChannelException) {
+            // channel closed, time to shut down
+            // throw SourceClosed(e)
+            cm = null
+            println("SubApp: channel closed, time to shut down.")
+        }
+        cm
+    }
+
+    private fun notifyCustomer(evtMsg: SampleChannelMessage?) {
+        println("SubApp: received published event:\n   $evtMsg")
     }
 }
